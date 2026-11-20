@@ -12,6 +12,16 @@
 //     it keeps a 4.5-day extrapolation from running away the way a line in raw
 //     hours would. Reads are weighted by recency (half-life 24 h), so the stale
 //     launch-night page and early dilution jumps matter less than the latest reads.
+//   - The fitted slope is shrunk toward 0 before it is extrapolated: a slope is
+//     only trusted as far as the data supports it. The shrinkage factor is
+//     k = b^2 / (b^2 + se(b)^2), where se(b)^2 is the slope's variance under the
+//     fit (residual variance divided by the spread of the reads in x), so a clean
+//     trend keeps its full slope while a noisy one — short history, large
+//     residuals — is damped toward the recent level. The shrunk line pivots on
+//     the weighted mean (xBar, yBar), so shrinking pulls the target forecast
+//     toward the recent level rather than toward the origin. A flat history has
+//     slope 0 and residual 0, so it is unchanged; a perfect trend (residual 0)
+//     keeps k = 1 and its full slope.
 //   - Read the fitted line at the target's x for the median (logit), and combine
 //     two honest sources of spread: the random-walk scale 0.5 * sqrt(horizon_days)
 //     (the house baseline's, growing with the square root of the horizon) and the
@@ -76,7 +86,9 @@ const logTime = (iso: string): number =>
  * Forecast one trophy. `points` are the usable (x, logit(rate)) reads, oldest
  * first, each with its recency weight; `lastRate` is the rate in the case's last
  * read (or the last non-null one); `xTarget` the target's log-time; `horizonDays`
- * the case horizon in days. Returns the median logit and the total spread.
+ * the case horizon in days. Returns the median logit and the total spread. The
+ * fitted slope is shrunk toward 0 by how well the data supports it (see the
+ * shrinkage below) before the line is read at the target.
  */
 function forecastTrophy(
   points: Array<{ x: number; y: number; w: number }>,
@@ -123,6 +135,17 @@ function forecastTrophy(
   const n = points.length;
   const nEff = (sw * sw) / sw2;
   const residVar = (swr2 / sw) * (n / Math.max(1, n - 2));
+  // Shrink the fitted slope toward 0 by how much of it the data supports.
+  // se(b)^2, the slope's variance under the fit, is residVar / sxx: when the
+  // residuals are large next to the slope, or the reads span little log-time,
+  // most of the slope is noise and the 4.5-day extrapolation would overshoot.
+  // k = b^2 / (b^2 + se(b)^2) is 1 for a perfect fit and near 0 when the slope
+  // is smaller than its own standard error. A flat history has b = 0, so the
+  // shrunk slope is 0 and the median is the weighted mean level, as before.
+  const seB2 = residVar / sxx;
+  if (!Number.isFinite(seB2)) return fallback;
+  const k = b * b > 0 ? (b * b) / (b * b + seB2) : 0;
+  const bShrunk = k * b;
   // Prediction variance of the line at the target: residual scale times
   // (1 + 1/n_eff + leverage of the extrapolation).
   const leverage = (xTarget - xBar) * (xTarget - xBar) / sxx;
@@ -130,7 +153,15 @@ function forecastTrophy(
   const sigma = Math.min(SIGMA_MAX, Math.sqrt(rw * rw + predVar));
   if (!Number.isFinite(sigma)) return fallback;
 
-  const medianLogit = Math.min(LOGIT_MAX, Math.max(LOGIT_MIN, a + b * xTarget));
+  // Read the shrunk line at the target, pivoting on the weighted mean so the
+  // forecast is pulled toward the recent level, not toward the origin. The
+  // spread is left as fitted from the unshrunk line: shrinkage narrows the
+  // point forecast, and the unshrunk residual scale keeps the quantiles honest
+  // about the noise the fit actually saw.
+  const medianLogit = Math.min(
+    LOGIT_MAX,
+    Math.max(LOGIT_MIN, yBar + bShrunk * (xTarget - xBar)),
+  );
   return { medianLogit, sigma };
 }
 
